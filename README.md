@@ -30,7 +30,14 @@ manifest（或直接上传 **CycloneDX JSON** SBOM），系统会：
    剩余根包重算可达集合，展示因退役失去可达性的包、仍被其他根包共用的包，
    以及随失联包消失的许可证冲突（附原最短路径）；预演为纯只读操作，
    **不创建审计、不改动复核标记**，原生 manifest 与 CycloneDX 审计均可使用，
-   可反复调整选择。
+   可反复调整选择；
+10. **单包许可证替换预演** —— 在网页第 4 节选择一条已保存审计、一个包和候选
+    SPDX 许可证（或调用 `GET /api/audits/{id}/relicense?package=…&license=…`），
+    服务端**仅替换该节点的许可证**，沿原依赖图（节点与依赖边不变）重算传递兼容判定
+    与最短冲突路径，并按「祖先包 → 被依赖包」配对原结果与预演结果：新增、消失及
+    等级变化的冲突都附上两侧的最短依赖路径，同时给出硬冲突数、告警数与冲突总数的
+    净变化；包不存在或候选许可证不在内置矩阵时返回明确错误（422）；预演为纯只读操作，
+    **不创建审计、不改动复核标记**，原生 manifest 与 CycloneDX 审计均可使用。
 
 ## 快速开始（Docker Compose，一键启动，推荐）
 
@@ -47,7 +54,7 @@ docker compose up --build          # 前台启动（加 -d 可后台运行）
 
 | 地址 | 说明 |
 | --- | --- |
-| <http://localhost:8000/> | 网页界面（已自动载入示例 manifest，可一键切换 CycloneDX 示例；第 2 节可对比两次历史审计，第 3 节可做根包退役预演） |
+| <http://localhost:8000/> | 网页界面（已自动载入示例 manifest，可一键切换 CycloneDX 示例；第 2 节可对比两次历史审计，第 3 节可做根包退役预演，第 4 节可做单包许可证替换预演） |
 | <http://localhost:8000/docs> | Swagger 风格交互式 JSON API 文档 |
 | <http://localhost:8000/redoc> | ReDoc API 文档 |
 | <http://localhost:8000/api/matrix> | 许可证兼容矩阵（机器可读） |
@@ -193,6 +200,7 @@ $ curl -s -X POST http://localhost:8000/api/audit -H "Content-Type: application/
 | GET | `/api/audits/{id}?download=true&package=xxx` | 导出（筛选后的）JSON 文件 |
 | GET | `/api/audits/compare/{base_id}/{target_id}` | **两次审计对比**（只读，不写入） |
 | GET | `/api/audits/{id}/retire?retire=a@1&retire=b@2` | **根包退役预演**（只读；不带参数返回根包列表） |
+| GET | `/api/audits/{id}/relicense?package=a@1&license=MIT` | **单包许可证替换预演**（只读；不带参数返回可选包与候选许可证列表） |
 | DELETE | `/api/audits/{id}` | 删除审计记录（不影响复核标记） |
 | POST | `/api/reviews` | **创建复核标记**（按审计中的冲突条目，跨审计生效） |
 | GET | `/api/reviews?state=active&fingerprint=…` | 复核标记记录列表（可按状态/指纹筛选） |
@@ -349,6 +357,57 @@ HTTP/1.1 422 Unprocessable Entity
 以及退役全部根包（`422`「不能退役全部根包」）同样返回明确错误。
 网页端在第 3 节选择审计后勾选根包即可预演，可反复调整勾选重新预演。
 
+### 单包许可证替换预演接口
+
+对一条已保存的审计，仅把**一个包节点**的许可证替换为候选 SPDX 许可证，
+沿**原依赖图**（节点与依赖边完全不变）重算传递兼容判定与最短冲突路径，
+再按「祖先包 → 被依赖包」配对原结果与预演结果：
+
+```bash
+# 不带参数：仅返回该审计的可选包列表与内置矩阵候选许可证（rehearsed=false）
+curl http://localhost:8000/api/audits/1/relicense
+
+# 预演：把 legacy-math@0.3.0 的许可证替换为 MIT（包名唯一时也可只给包名）
+curl "http://localhost:8000/api/audits/1/relicense?package=legacy-math@0.3.0&license=MIT"
+```
+
+返回内容（`rehearsed=true` 时）：
+
+- `target` —— 被替换的包及 `license_before` / `license_after`（含规范化 token 与分类）；
+- `summary` —— 硬冲突数（`conflicts_before/after/net`）、告警数
+  （`warnings_before/after/net`）与**冲突总数净变化**（`total_before/after/net`），
+  以及新增/消失/变化配对数（`added`/`removed`/`changed`，含 `severity_changed`
+  等级变化数与新增/消失中的硬冲突数）；
+- `comparison` —— 与两次审计对比相同的配对结构：`added`（仅预演结果存在）、
+  `removed`（仅原结果存在）、`changed`（两侧都存在但严重程度/判定状态/许可证变化），
+  每条记录的 `base` / `target` 两侧均携带完整冲突对象（含各自的最短依赖路径
+  `path` 与 `distance`），缺失一侧为 `null`；
+- `rehearsal` —— 预演结果的元信息（状态、包数、冲突数等；**没有 `audit_id`**，
+  预演不落库）。
+
+候选许可证必须是内置兼容矩阵中的 SPDX 标识（`GET /api/matrix` 或预览接口返回的
+`candidate_licenses`，常见别名如 `apache 2` 会自动规范化）；包不存在、包名对应
+多个版本（需 `name@version` 消歧）或候选许可证不在矩阵中时返回明确错误：
+
+```bash
+$ curl -i "http://localhost:8000/api/audits/999/relicense?package=a@1&license=MIT"
+HTTP/1.1 404 Not Found
+{"detail":"审计记录不存在：999。许可证替换预演为只读操作，不会创建新审计。"}
+
+$ curl -i "http://localhost:8000/api/audits/1/relicense?package=ghost@9&license=MIT"
+HTTP/1.1 422 Unprocessable Entity
+{"detail":"审计中不存在包：ghost@9。许可证替换预演只能选择该审计已声明的包节点。"}
+
+$ curl -i "http://localhost:8000/api/audits/1/relicense?package=font-pack@2.0.0&license=OFL-1.1"
+HTTP/1.1 422 Unprocessable Entity
+{"detail":"候选许可证 'OFL-1.1' 不在内置兼容矩阵中，无法预演。可选 SPDX 标识：MIT、ISC、BSD-2-Clause、…。"}
+```
+
+预演是**只读**操作，不会创建审计或改动复核标记；原生 manifest 与 CycloneDX
+审计结果均可直接使用。网页端在第 4 节选择审计、包与候选许可证后点击
+「预演替换」即可查看净变化统计与三组配对冲突（含两侧最短路径），
+可反复更换候选许可证重新预演。
+
 ## 审计结果结构（节选）
 
 ```json
@@ -411,13 +470,14 @@ CycloneDX 导入的审计结果结构相同，另带 `"source_format": "cycloned
 │   ├── cyclonedx.py   # CycloneDX JSON 导入：bom-ref 映射节点、ref/dependsOn 还原依赖边
 │   ├── compare.py     # 两次审计对比：节点/冲突配对与变化检测（纯只读）
 │   ├── retire.py      # 根包退役预演：从剩余根包重算可达集合（纯只读）
+│   ├── relicense.py   # 单包许可证替换预演：替换一个节点许可证后沿原图重算并配对（纯只读）
 │   ├── reviews.py     # 复核标记：指纹计算、失效时间规范化、审计结果附着
 │   ├── licenses.py    # 许可证别名规范化与兼容矩阵
 │   └── database.py    # SQLite 初始化与审计记录/复核标记持久化
 ├── static/
 │   ├── index.html     # 单文件网页（无外部 CDN 依赖）
 │   └── examples/      # sample-manifest.json 与 sample-cyclonedx.json 两个内置示例
-├── tests/             # 轻量自测：python -m tests.test_analyzer / test_compare / test_reviews / test_cyclonedx / test_retire
+├── tests/             # 轻量自测：python -m tests.test_analyzer / test_compare / test_reviews / test_cyclonedx / test_retire / test_relicense
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

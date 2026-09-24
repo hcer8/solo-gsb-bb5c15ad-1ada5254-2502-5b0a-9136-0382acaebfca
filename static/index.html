@@ -181,10 +181,29 @@
     <div id="retire-result" class="hidden-block" style="margin-top:18px;"></div>
   </section>
 
+  <section class="card">
+    <h2>4. 单包许可证替换预演 <span class="pill">只读 · 不创建审计</span></h2>
+    <div id="relicense-alert" class="alert"></div>
+    <div class="row">
+      <select id="relicense-audit"></select>
+      <select id="relicense-package"></select>
+      <select id="relicense-license"></select>
+      <button id="btn-relicense" disabled>预演替换</button>
+    </div>
+    <div class="hint" style="margin-top:8px;">
+      选择一条已保存的审计、一个包和候选 SPDX 许可证（内置兼容矩阵中的 14 个标识）后，
+      服务端<b>仅替换该节点的许可证</b>，沿原依赖图（节点与依赖边不变）重算传递兼容判定与最短冲突路径，
+      并按「祖先包 → 被依赖包」配对原结果与预演结果：新增、消失及等级变化的冲突都会附上两侧的最短依赖路径，
+      同时给出硬冲突数、告警数与冲突总数的净变化。
+      预演为只读操作，可反复更换候选许可证重新预演，不会创建审计或改动复核标记。
+    </div>
+    <div id="relicense-result" class="hidden-block" style="margin-top:18px;"></div>
+  </section>
+
   <section id="result" class="hidden-block">
     <div class="card">
       <div class="row" style="justify-content:space-between;">
-        <h2 style="margin:0;">4. 审计结果 <span id="r-name" class="muted" style="font-weight:400;font-size:13px;"></span></h2>
+        <h2 style="margin:0;">5. 审计结果 <span id="r-name" class="muted" style="font-weight:400;font-size:13px;"></span></h2>
         <span id="r-status"></span>
       </div>
       <div class="stats" style="margin-top:14px;">
@@ -205,7 +224,7 @@
     </div>
 
     <div class="card">
-      <h2>5. 冲突与最短依赖路径 <span id="review-stats" class="pill" style="font-weight:400;"></span></h2>
+      <h2>6. 冲突与最短依赖路径 <span id="review-stats" class="pill" style="font-weight:400;"></span></h2>
       <div id="review-alert" class="alert"></div>
       <div class="hint" style="margin-bottom:10px;">
         复核标记按「祖先节点 + 被依赖节点 + 双方规范化许可证」生成指纹，跨审计生效：
@@ -215,7 +234,7 @@
     </div>
 
     <div class="card">
-      <h2>6. 节点与传递约束</h2>
+      <h2>7. 节点与传递约束</h2>
       <div style="overflow-x:auto;">
       <table id="nodes-table">
         <thead><tr><th>节点</th><th>版本</th><th>许可证</th><th>约束来源（传递）</th><th>硬冲突</th></tr></thead>
@@ -225,7 +244,7 @@
     </div>
 
     <div class="card">
-      <h2>7. 告警与未解析依赖</h2>
+      <h2>8. 告警与未解析依赖</h2>
       <div id="warnings"></div>
     </div>
   </section>
@@ -520,7 +539,7 @@ async function loadAuditList() {
     showCompareAlert(e.message);
     return [];
   }
-  const prev = { base: $("cmp-base").value, target: $("cmp-target").value, retire: $("retire-audit").value };
+  const prev = { base: $("cmp-base").value, target: $("cmp-target").value, retire: $("retire-audit").value, relicense: $("relicense-audit").value };
   const fill = (sel, selected) => {
     sel.innerHTML = "";
     const placeholder = document.createElement("option");
@@ -538,6 +557,7 @@ async function loadAuditList() {
   fill($("cmp-base"), prev.base);
   fill($("cmp-target"), prev.target || (items.length > 1 ? String(items[1].id) : ""));
   fill($("retire-audit"), prev.retire || (items.length ? String(items[0].id) : ""));
+  fill($("relicense-audit"), prev.relicense || (items.length ? String(items[0].id) : ""));
   // 首次加载默认选最新两条（列表为倒序：items[0] 最新）
   if (!prev.base && items.length) $("cmp-base").value = String(items[0].id);
   // 退役预演的根包列表随审计选择联动加载
@@ -547,6 +567,16 @@ async function loadAuditList() {
     $("retire-roots").innerHTML = "";
     $("retire-result").className = "hidden-block";
     $("btn-rehearse").disabled = true;
+  }
+  // 许可证替换预演的包/候选许可证列表随审计选择联动加载
+  if ($("relicense-audit").value) {
+    await loadRelicensePreview();
+  } else {
+    relicensePackages = [];
+    $("relicense-package").innerHTML = "";
+    $("relicense-license").innerHTML = "";
+    $("relicense-result").className = "hidden-block";
+    $("btn-relicense").disabled = true;
   }
   return items;
 }
@@ -834,6 +864,136 @@ $("btn-rehearse").addEventListener("click", async () => {
     showRetireAlert("预演请求失败：" + e.message);
   } finally {
     $("btn-rehearse").disabled = false;
+  }
+});
+
+// --- 单包许可证替换预演 -------------------------------------------------------
+
+let relicensePackages = [];  // 当前选中审计的包列表（预览接口返回）
+
+function showRelicenseAlert(msg) {
+  const el = $("relicense-alert");
+  el.textContent = msg;
+  el.className = "alert error show";
+}
+function clearRelicenseAlert() { $("relicense-alert").className = "alert"; }
+
+async function loadRelicensePreview() {
+  clearRelicenseAlert();
+  const aid = $("relicense-audit").value;
+  $("relicense-result").className = "hidden-block";
+  $("relicense-result").innerHTML = "";
+  const pkgSel = $("relicense-package"), licSel = $("relicense-license");
+  pkgSel.innerHTML = "";
+  licSel.innerHTML = "";
+  if (!aid) { $("btn-relicense").disabled = true; return; }
+  let data;
+  try {
+    const resp = await fetch("/api/audits/" + aid + "/relicense");
+    data = await resp.json();
+    if (!resp.ok) throw new Error(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail));
+  } catch (e) {
+    showRelicenseAlert("加载包列表失败：" + e.message);
+    $("btn-relicense").disabled = true;
+    return;
+  }
+  relicensePackages = data.packages || [];
+  if (!relicensePackages.length) {
+    pkgSel.innerHTML = "<option value=''>（该审计没有可替换的包）</option>";
+    $("btn-relicense").disabled = true;
+    return;
+  }
+  relicensePackages.forEach((p) => {
+    const opt = document.createElement("option");
+    opt.value = p.id;
+    opt.textContent = p.id + " · 当前 " + p.license_display;
+    pkgSel.appendChild(opt);
+  });
+  (data.candidate_licenses || []).forEach((c) => {
+    const opt = document.createElement("option");
+    opt.value = c.token;
+    opt.textContent = c.token + "（" + c.category_label + "）";
+    licSel.appendChild(opt);
+  });
+  syncRelicenseLicense();
+  $("btn-relicense").disabled = false;
+}
+
+function syncRelicenseLicense() {
+  // 默认选中该包当前的许可证，便于改成其他候选；未知许可证不在矩阵中则保持首项
+  const pkg = relicensePackages.find((p) => p.id === $("relicense-package").value);
+  if (!pkg) return;
+  const licSel = $("relicense-license");
+  if (Array.from(licSel.options).some((o) => o.value === pkg.license)) licSel.value = pkg.license;
+}
+
+function renderRelicenseResult(data) {
+  const cmp = data.comparison;
+  // 复用两次审计对比的路径/条目渲染（基准=原审计结果，目标=预演结果）
+  window.__cmpNodeMaps = { base: {}, target: {} };
+  cmp.nodes.forEach((n) => {
+    if (n.base) window.__cmpNodeMaps.base[n.id] = n.base;
+    if (n.target) window.__cmpNodeMaps.target[n.id] = n.target;
+  });
+  window.__cmpLabels = cmp.field_labels || {};
+
+  const s = data.summary;
+  const t = data.target;
+  const net = (n) => (n > 0 ? "+" + n : String(n));
+  const netSpan = (n) => '<b class="' + (n > 0 ? "diff-remove" : n < 0 ? "diff-add" : "") + '">(' + net(n) + ")</b>";
+  const beforeAfter = (b, a, n) => b + '<span class="diff-arrow">→</span>' + a + " " + netSpan(n);
+
+  let html = '<div class="meta-line">审计 <span class="mono">#' + esc(data.audit.audit_id) + " · " +
+    esc(data.audit.manifest_name || "") + "</span> · 包 <span class='mono'><b>" + esc(t.id) + "</b></span> 许可证 " +
+    '<span class="diff-remove">' + esc(t.license_before.display) + '</span><span class="diff-arrow">→</span>' +
+    '<span class="diff-add">' + esc(t.license_after.display) + "</span>" +
+    '<span class="muted">（基准=原审计结果，目标=替换许可证后的预演结果）</span></div>';
+
+  html += '<div class="stats">' +
+    '<div class="stat"><div class="num">' + beforeAfter(s.conflicts_before, s.conflicts_after, s.conflicts_net) + '</div><div class="label">硬冲突（原 → 预演 · 净变化）</div></div>' +
+    '<div class="stat"><div class="num">' + beforeAfter(s.warnings_before, s.warnings_after, s.warnings_net) + '</div><div class="label">许可证告警（原 → 预演 · 净变化）</div></div>' +
+    '<div class="stat"><div class="num">' + beforeAfter(s.total_before, s.total_after, s.total_net) + '</div><div class="label">冲突总数（硬冲突+告警）净变化</div></div>' +
+    '<div class="stat"><div class="num diff-add">+' + s.added + '</div><div class="label">新增冲突/告警（硬冲突 ' + s.added_errors + "）</div></div>" +
+    '<div class="stat"><div class="num diff-remove">−' + s.removed + '</div><div class="label">消失冲突/告警（硬冲突 ' + s.removed_errors + "）</div></div>" +
+    '<div class="stat"><div class="num diff-change">≈' + s.changed + '</div><div class="label">配对项变化（等级变化 ' + s.severity_changed + "）</div></div>" +
+    "</div>";
+
+  html += renderFindingsBox("🆕 预演新增的冲突/告警（仅预演结果存在）", cmp.added) +
+    renderFindingsBox("❌ 预演后消失的冲突/告警（仅原结果存在）", cmp.removed) +
+    renderFindingsBox("🔁 等级/判定变化的配对冲突（两侧均存在）", cmp.changed);
+  if (!cmp.added.length && !cmp.removed.length && !cmp.changed.length) {
+    html += '<p class="muted" style="margin-top:12px;">替换为 ' + esc(t.license_after.display) + " 后，冲突/告警没有任何变化。</p>";
+  }
+
+  const box = $("relicense-result");
+  box.innerHTML = html;
+  box.className = "";
+}
+
+$("relicense-audit").addEventListener("change", loadRelicensePreview);
+$("relicense-package").addEventListener("change", syncRelicenseLicense);
+$("btn-relicense").addEventListener("click", async () => {
+  clearRelicenseAlert();
+  const aid = $("relicense-audit").value;
+  const pkg = $("relicense-package").value;
+  const lic = $("relicense-license").value;
+  if (!aid) { showRelicenseAlert("请先选择一条审计记录。"); return; }
+  if (!pkg) { showRelicenseAlert("请选择要替换许可证的包。"); return; }
+  if (!lic) { showRelicenseAlert("请选择候选 SPDX 许可证。"); return; }
+  $("btn-relicense").disabled = true;
+  try {
+    const resp = await fetch("/api/audits/" + aid + "/relicense?package=" +
+      encodeURIComponent(pkg) + "&license=" + encodeURIComponent(lic));
+    const data = await resp.json();
+    if (!resp.ok) {
+      showRelicenseAlert(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail));
+      return;
+    }
+    renderRelicenseResult(data);
+  } catch (e) {
+    showRelicenseAlert("预演请求失败：" + e.message);
+  } finally {
+    $("btn-relicense").disabled = false;
   }
 });
 
