@@ -181,10 +181,29 @@
     <div id="retire-result" class="hidden-block" style="margin-top:18px;"></div>
   </section>
 
+  <section class="card">
+    <h2>4. 单包许可证替换预演 <span class="pill">只读 · 不创建审计</span></h2>
+    <div id="swap-alert" class="alert"></div>
+    <div class="row">
+      <select id="swap-audit"></select>
+      <select id="swap-package"></select>
+      <select id="swap-license"></select>
+      <button id="btn-swap" disabled>预演替换许可证</button>
+    </div>
+    <div class="hint" style="margin-top:8px;">
+      选择一条已保存审计、审计中的<b>单个包</b>与内置矩阵中的<b>候选 SPDX 许可证</b>后，
+      服务端通过只读 API 仅替换该节点的许可证（依赖图不变），并沿原依赖图重算传递兼容判定与最短冲突路径，
+      按「祖先包 → 被依赖包」配对原结果与预演结果，列出新增、消失及等级变化的冲突（附双方最短路径）
+      与冲突总数净变化。包不存在或候选许可证不在内置矩阵时会明确报错；预演不创建审计、不改复核标记，
+      原生 manifest 与 CycloneDX 审计均可使用。
+    </div>
+    <div id="swap-result" class="hidden-block" style="margin-top:18px;"></div>
+  </section>
+
   <section id="result" class="hidden-block">
     <div class="card">
       <div class="row" style="justify-content:space-between;">
-        <h2 style="margin:0;">4. 审计结果 <span id="r-name" class="muted" style="font-weight:400;font-size:13px;"></span></h2>
+        <h2 style="margin:0;">5. 审计结果 <span id="r-name" class="muted" style="font-weight:400;font-size:13px;"></span></h2>
         <span id="r-status"></span>
       </div>
       <div class="stats" style="margin-top:14px;">
@@ -205,7 +224,7 @@
     </div>
 
     <div class="card">
-      <h2>5. 冲突与最短依赖路径 <span id="review-stats" class="pill" style="font-weight:400;"></span></h2>
+      <h2>6. 冲突与最短依赖路径 <span id="review-stats" class="pill" style="font-weight:400;"></span></h2>
       <div id="review-alert" class="alert"></div>
       <div class="hint" style="margin-bottom:10px;">
         复核标记按「祖先节点 + 被依赖节点 + 双方规范化许可证」生成指纹，跨审计生效：
@@ -215,7 +234,7 @@
     </div>
 
     <div class="card">
-      <h2>6. 节点与传递约束</h2>
+      <h2>7. 节点与传递约束</h2>
       <div style="overflow-x:auto;">
       <table id="nodes-table">
         <thead><tr><th>节点</th><th>版本</th><th>许可证</th><th>约束来源（传递）</th><th>硬冲突</th></tr></thead>
@@ -225,7 +244,7 @@
     </div>
 
     <div class="card">
-      <h2>7. 告警与未解析依赖</h2>
+      <h2>8. 告警与未解析依赖</h2>
       <div id="warnings"></div>
     </div>
   </section>
@@ -520,7 +539,7 @@ async function loadAuditList() {
     showCompareAlert(e.message);
     return [];
   }
-  const prev = { base: $("cmp-base").value, target: $("cmp-target").value, retire: $("retire-audit").value };
+  const prev = { base: $("cmp-base").value, target: $("cmp-target").value, retire: $("retire-audit").value, swap: $("swap-audit").value };
   const fill = (sel, selected) => {
     sel.innerHTML = "";
     const placeholder = document.createElement("option");
@@ -538,6 +557,7 @@ async function loadAuditList() {
   fill($("cmp-base"), prev.base);
   fill($("cmp-target"), prev.target || (items.length > 1 ? String(items[1].id) : ""));
   fill($("retire-audit"), prev.retire || (items.length ? String(items[0].id) : ""));
+  fill($("swap-audit"), prev.swap || (items.length ? String(items[0].id) : ""));
   // 首次加载默认选最新两条（列表为倒序：items[0] 最新）
   if (!prev.base && items.length) $("cmp-base").value = String(items[0].id);
   // 退役预演的根包列表随审计选择联动加载
@@ -547,6 +567,14 @@ async function loadAuditList() {
     $("retire-roots").innerHTML = "";
     $("retire-result").className = "hidden-block";
     $("btn-rehearse").disabled = true;
+  }
+  // 许可证替换预演的包列表同样随审计选择联动加载
+  if ($("swap-audit").value) {
+    await loadSwapPackages();
+  } else {
+    $("swap-package").innerHTML = "";
+    $("swap-result").className = "hidden-block";
+    $("btn-swap").disabled = true;
   }
   return items;
 }
@@ -836,6 +864,225 @@ $("btn-rehearse").addEventListener("click", async () => {
     $("btn-rehearse").disabled = false;
   }
 });
+
+// --- 单包许可证替换预演 ------------------------------------------------------
+
+let swapMatrixLoaded = false;
+let swapNodesBefore = [];  // 原审计节点（渲染“原结果”路径时标注许可证）
+let swapNodesAfter = [];   // 预演后节点简表（渲染“预演结果”路径时标注许可证）
+
+function showSwapAlert(msg) {
+  const el = $("swap-alert");
+  el.textContent = msg;
+  el.className = "alert error show";
+}
+function clearSwapAlert() { $("swap-alert").className = "alert"; }
+
+async function ensureSwapMatrix() {
+  if (swapMatrixLoaded) return;
+  const resp = await fetch("/api/matrix");
+  const data = await resp.json();
+  if (!resp.ok) throw new Error(data.detail || "加载许可证矩阵失败");
+  const sel = $("swap-license");
+  sel.innerHTML = '<option value="">候选 SPDX 许可证…</option>';
+  // 按许可证类别分组（与矩阵行顺序一致）
+  const byCat = {};
+  (data.matrix || []).forEach((row) => {
+    (byCat[row.category] = byCat[row.category] || []).push(row.parent);
+  });
+  Object.keys(byCat).forEach((cat) => {
+    const group = document.createElement("optgroup");
+    group.label = (data.categories && data.categories[cat]) || cat;
+    byCat[cat].forEach((token) => {
+      const opt = document.createElement("option");
+      opt.value = token;
+      opt.textContent = token;
+      group.appendChild(opt);
+    });
+    sel.appendChild(group);
+  });
+  swapMatrixLoaded = true;
+}
+
+async function loadSwapPackages() {
+  clearSwapAlert();
+  const aid = $("swap-audit").value;
+  const pkgSel = $("swap-package");
+  $("swap-result").className = "hidden-block";
+  $("swap-result").innerHTML = "";
+  $("btn-swap").disabled = true;
+  if (!aid) {
+    pkgSel.innerHTML = "";
+    swapNodesBefore = [];
+    return;
+  }
+  try {
+    const resp = await fetch("/api/audits/" + aid);
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail));
+    swapNodesBefore = data.nodes || [];
+    pkgSel.innerHTML = '<option value="">选择要替换许可证的包…</option>';
+    swapNodesBefore.forEach((n) => {
+      const opt = document.createElement("option");
+      opt.value = n.id;
+      opt.textContent = n.id + "（当前：" + n.license_display + "）";
+      pkgSel.appendChild(opt);
+    });
+    if (swapNodesBefore.length) $("btn-swap").disabled = false;
+  } catch (e) {
+    pkgSel.innerHTML = "";
+    swapNodesBefore = [];
+    showSwapAlert("加载审计包列表失败：" + e.message);
+  }
+}
+
+function swapNodeMap(side) {
+  const map = {};
+  (side === "after" ? swapNodesAfter : swapNodesBefore).forEach((n) => { map[n.id] = n; });
+  return map;
+}
+
+function renderSwapPath(path, side) {
+  const map = swapNodeMap(side);
+  return '<div class="path-label"><span class="tag ' + side + '">' +
+    (side === "before" ? "原结果" : "预演结果") + "</span>最短依赖路径（" + (path.length - 1) + " 跳）</div>" +
+    '<div class="path ' + (side === "before" ? "base" : "target") + '">' + path.map((nid) => {
+      const node = map[nid];
+      const lic = node ? node.license_display : "";
+      return esc(nid) + (lic ? ' <span class="muted">[' + esc(lic) + "]</span>" : "");
+    }).join('<span class="arrow">→</span>') + "</div>";
+}
+
+const SWAP_ROLE_BADGE = {
+  as_ancestor: '<span class="badge conflict">被替换包=祖先</span>',
+  as_dependency: '<span class="badge warning">被替换包=被依赖方</span>',
+  unrelated: '<span class="pill">其他祖先/被依赖方</span>',
+};
+
+function swapFindingTitle(f) {
+  return '<span class="mono"><b>' + esc(f.ancestor) + "</b> ── <span class='muted'>许可证</span> ── <b>" +
+    esc(f.node) + "</b></span>";
+}
+
+function renderSwapFindings(title, list, empty) {
+  let html = "<h3 style='margin:16px 0 8px;font-size:14px;'>" + esc(title) +
+    ' <span class="pill">' + list.length + " 条</span></h3>";
+  if (!list.length) return html + '<p class="muted">' + esc(empty) + "</p>";
+  html += list.map((f) => {
+    const present = f.after || f.before;
+    const paths = [];
+    if (f.before) paths.push(renderSwapPath(f.before.path, "before"));
+    if (f.after) paths.push(renderSwapPath(f.after.path, "after"));
+    let head;
+    if (f.change === "changed") {
+      head = severityBadge(f.severity_before) + '<span class="diff-arrow">→</span>' + severityBadge(f.severity_after);
+    } else {
+      head = severityBadge(present.severity);
+    }
+    let fields = "";
+    if (f.fields_changed && f.fields_changed.length) {
+      const labels = f.fields_changed.map((k) => (window.__swapLabels && window.__swapLabels[k]) || k).join("、");
+      fields = '<div class="fields-changed">变化项：' + esc(labels) + "</div>";
+    }
+    // 双方许可证对（祖先 → 被依赖方），变化的许可证高亮
+    const licPair = (f.before ? esc(f.before.ancestor_license) : "—") +
+      '<span class="diff-arrow">→</span>' + (f.after ? esc(f.after.ancestor_license) : "—") +
+      ' &nbsp;|&nbsp; ' +
+      (f.before ? esc(f.before.node_license) : "—") +
+      '<span class="diff-arrow">→</span>' + (f.after ? esc(f.after.node_license) : "—");
+    const reason = present.reason ? '<div class="reason">' + esc(present.reason) + "</div>" : "";
+    return '<div class="conflict ' + (present.severity === "error" ? "error" : "warning") + '">' +
+      '<div class="head">' + head + (SWAP_ROLE_BADGE[f.role] || "") + swapFindingTitle(f) +
+      '<span class="pill">' + esc(licPair) + "</span></div>" +
+      fields + reason + paths.join("") + "</div>";
+  }).join("");
+  return html;
+}
+
+function deltaNum(value, suffix) {
+  const cls = value < 0 ? "diff-remove" : value > 0 ? "diff-add" : "";
+  const sign = value > 0 ? "+" : "";
+  return '<span class="' + cls + '">' + sign + value + "</span>" + (suffix || "");
+}
+
+function renderSwapResult(data) {
+  window.__swapLabels = data.field_labels || {};
+  swapNodesAfter = data.nodes_after || [];
+  const s = data.summary;
+  const pkg = data.package;
+  let html = '<div class="meta-line">审计 <span class="mono">#' + esc(String(data.audit.audit_id)) + " · " +
+    esc(data.audit.manifest_name || "") + '</span> · 仅替换 <span class="mono"><b>' + esc(pkg.id) +
+    "</b></span> 的许可证：<span class='diff-remove'>" + esc(pkg.before.license_display) +
+    "</span><span class='diff-arrow'>→</span><span class='diff-add'>" + esc(pkg.after.license_display) + "</span>" +
+    (pkg.unchanged_license ? ' <span class="pill">候选与原许可证相同（规范化后一致）</span>' : "") +
+    (data.audit.source_format ? ' <span class="pill">' + esc(data.audit.source_format) + "</span>" : "") +
+    "</div>";
+
+  html += '<div class="stats">' +
+    '<div class="stat"><div class="num">' + s.before.conflicts + '<span class="diff-arrow">→</span>' + s.after.conflicts + "</div><div class='label'>硬冲突（原 → 预演）· 净 " + deltaNum(s.net.conflicts) + "</div></div>" +
+    '<div class="stat"><div class="num">' + s.before.warnings + '<span class="diff-arrow">→</span>' + s.after.warnings + "</div><div class='label'>需人工确认告警（原 → 预演）· 净 " + deltaNum(s.net.warnings) + "</div></div>" +
+    '<div class="stat"><div class="num">' + s.before.total + '<span class="diff-arrow">→</span>' + s.after.total + "</div><div class='label'>冲突/告警总数（原 → 预演）· 净 " + deltaNum(s.net.total) + "</div></div>" +
+    '<div class="stat"><div class="num diff-add">+' + s.added + "</div><div class='label'>新增（硬冲突 " + s.added_errors + "）</div></div>" +
+    '<div class="stat"><div class="num diff-remove">−' + s.removed + "</div><div class='label'>消失（硬冲突 " + s.removed_errors + "）</div></div>" +
+    '<div class="stat"><div class="num diff-change">≈' + s.changed + "</div><div class='label'>等级/状态变化（硬冲突 " + s.changed_errors + "）</div></div>" +
+    "</div>";
+
+  const flips = s.severity_flips || {};
+  if (flips.error_to_warning || flips.warning_to_error) {
+    html += '<div class="hint" style="margin:6px 0 0;">等级翻转：硬冲突→告警 <b class="diff-add">' +
+      flips.error_to_warning + "</b> 条；告警→硬冲突 <b class='diff-remove'>" +
+      flips.warning_to_error + " 条。审计整体状态：" +
+      esc(STATUS_LABEL[s.before.status] || s.before.status) + '<span class="diff-arrow">→</span>' +
+      esc(STATUS_LABEL[s.after.status] || s.after.status) + "。</div>";
+  } else {
+    html += '<div class="hint" style="margin:6px 0 0;">审计整体状态：' +
+      esc(STATUS_LABEL[s.before.status] || s.before.status) + '<span class="diff-arrow">→</span>' +
+      esc(STATUS_LABEL[s.after.status] || s.after.status) + "。</div>";
+  }
+
+  html += renderSwapFindings("🆕 新增的冲突/告警（仅预演结果存在）", data.added, "替换后没有新增冲突或告警。") +
+    renderSwapFindings("❌ 消失的冲突/告警（仅原结果存在）", data.removed, "替换后没有冲突或告警消失。") +
+    renderSwapFindings("🔁 等级/状态变化的配对项", data.changed, "没有冲突或告警发生等级/状态变化。");
+
+  $("swap-result").innerHTML = html;
+  $("swap-result").className = "";
+}
+
+$("swap-audit").addEventListener("change", loadSwapPackages);
+$("btn-swap").addEventListener("click", async () => {
+  clearSwapAlert();
+  const aid = $("swap-audit").value;
+  const pkg = $("swap-package").value;
+  try {
+    await ensureSwapMatrix();  // 启动时拉取失败则在点击时补一次
+  } catch (e) {
+    showSwapAlert("加载内置许可证矩阵失败：" + e.message);
+    return;
+  }
+  const license = $("swap-license").value;
+  if (!aid) { showSwapAlert("请先选择一条审计记录。"); return; }
+  if (!pkg) { showSwapAlert("请选择要替换许可证的包。"); return; }
+  if (!license) { showSwapAlert("请选择内置矩阵中的候选 SPDX 许可证。"); return; }
+  $("btn-swap").disabled = true;
+  try {
+    const url = "/api/audits/" + aid + "/license-swap?package=" + encodeURIComponent(pkg) +
+      "&license=" + encodeURIComponent(license);
+    const resp = await fetch(url);
+    const data = await resp.json();
+    if (!resp.ok) {
+      showSwapAlert(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail));
+      return;
+    }
+    renderSwapResult(data);
+  } catch (e) {
+    showSwapAlert("许可证替换预演请求失败：" + e.message);
+  } finally {
+    $("btn-swap").disabled = false;
+  }
+});
+
+// 页面加载即准备许可证候选矩阵（失败不阻塞，首次预演时会再次尝试）
+ensureSwapMatrix().catch(() => { swapMatrixLoaded = false; });
 
 // 自动载入示例，便于首次访问
 $("btn-sample").click();

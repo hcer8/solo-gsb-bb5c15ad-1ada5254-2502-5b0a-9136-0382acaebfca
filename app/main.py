@@ -16,6 +16,7 @@ from . import (
     analyzer,
     compare as compare_mod,
     database,
+    license_swap as swap_mod,
     licenses,
     retire as retire_mod,
     reviews as reviews_mod,
@@ -157,6 +158,35 @@ def retire_rehearsal(
         retire_ids.extend(part.strip() for part in str(item).split(",") if part.strip())
     try:
         return retire_mod.rehearse_retirement(result, retire_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.get(
+    "/api/audits/{audit_id}/license-swap",
+    tags=["audit"],
+    summary="单包许可证替换预演（只读）：仅替换指定节点许可证并沿原图重算冲突",
+)
+def license_swap_rehearsal(
+    audit_id: int,
+    package: str = Query(
+        ...,
+        description="要替换许可证的包：name@version（精确）或包名（审计中唯一时自动解析）",
+    ),
+    candidate_license: str = Query(
+        ...,
+        alias="license",
+        description="候选 SPDX 许可证（须在内置矩阵中，支持常见别名，如 Apache-2.0 / GPLv3）",
+    ),
+) -> Dict[str, Any]:
+    result = database.get_audit(audit_id)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail="审计记录不存在：%s。许可证替换预演为只读操作，不会创建新审计。" % audit_id,
+        )
+    try:
+        return swap_mod.rehearse_license_swap(result, package, candidate_license)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 

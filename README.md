@@ -31,6 +31,14 @@ manifest（或直接上传 **CycloneDX JSON** SBOM），系统会：
    以及随失联包消失的许可证冲突（附原最短路径）；预演为纯只读操作，
    **不创建审计、不改动复核标记**，原生 manifest 与 CycloneDX 审计均可使用，
    可反复调整选择。
+10. **单包许可证替换预演** —— 在网页第 4 节选择一条已保存审计、其中的单个包与
+    内置矩阵中的候选 SPDX 许可证（或调用
+    `GET /api/audits/{id}/license-swap?package=…&license=…`），服务端通过**只读 API**
+    仅替换该节点的许可证（依赖图保持不变），并沿**原依赖图**重算传递兼容判定与
+    最短冲突路径；按「祖先包 → 被依赖包」配对原结果与预演结果，列出**新增、消失及
+    等级变化**的冲突，每条附双方各自的最短路径，并给出冲突总数净变化与硬冲突/告警
+    净变化。包不存在或候选许可证不在内置矩阵时返回明确错误（422/404）；预演
+    **不创建审计、不改复核标记**，原生 manifest 与 CycloneDX 审计均可使用，可反复预演。
 
 ## 快速开始（Docker Compose，一键启动，推荐）
 
@@ -47,7 +55,7 @@ docker compose up --build          # 前台启动（加 -d 可后台运行）
 
 | 地址 | 说明 |
 | --- | --- |
-| <http://localhost:8000/> | 网页界面（已自动载入示例 manifest，可一键切换 CycloneDX 示例；第 2 节可对比两次历史审计，第 3 节可做根包退役预演） |
+| <http://localhost:8000/> | 网页界面（已自动载入示例 manifest，可一键切换 CycloneDX 示例；第 2 节可对比两次历史审计，第 3 节可做根包退役预演，第 4 节可做单包许可证替换预演） |
 | <http://localhost:8000/docs> | Swagger 风格交互式 JSON API 文档 |
 | <http://localhost:8000/redoc> | ReDoc API 文档 |
 | <http://localhost:8000/api/matrix> | 许可证兼容矩阵（机器可读） |
@@ -193,6 +201,7 @@ $ curl -s -X POST http://localhost:8000/api/audit -H "Content-Type: application/
 | GET | `/api/audits/{id}?download=true&package=xxx` | 导出（筛选后的）JSON 文件 |
 | GET | `/api/audits/compare/{base_id}/{target_id}` | **两次审计对比**（只读，不写入） |
 | GET | `/api/audits/{id}/retire?retire=a@1&retire=b@2` | **根包退役预演**（只读；不带参数返回根包列表） |
+| GET | `/api/audits/{id}/license-swap?package=a@1&license=MIT` | **单包许可证替换预演**（只读；仅替换该节点许可证并沿原图重算冲突） |
 | DELETE | `/api/audits/{id}` | 删除审计记录（不影响复核标记） |
 | POST | `/api/reviews` | **创建复核标记**（按审计中的冲突条目，跨审计生效） |
 | GET | `/api/reviews?state=active&fingerprint=…` | 复核标记记录列表（可按状态/指纹筛选） |
@@ -349,6 +358,68 @@ HTTP/1.1 422 Unprocessable Entity
 以及退役全部根包（`422`「不能退役全部根包」）同样返回明确错误。
 网页端在第 3 节选择审计后勾选根包即可预演，可反复调整勾选重新预演。
 
+### 单包许可证替换预演接口
+
+在**不改动依赖图**的前提下，仅把指定单个包节点的许可证替换为内置矩阵中的某个
+候选 SPDX 许可证，随后复用同一套传递约束与 BFS 最短路径算法沿**原依赖图**重算：
+
+```bash
+# package 支持 name@version（精确，大小写不敏感）或审计中唯一的包名；
+# license 须为内置矩阵中的 SPDX 标识，也接受常见别名（apache 2.0、GPLv3…）。
+curl "http://localhost:8000/api/audits/1/license-swap?package=billing-core@1.2.0&license=MIT"
+curl "http://localhost:8000/api/audits/1/license-swap?package=pdf-export&license=Apache-2.0"
+```
+
+返回内容（`read_only: true`，`kind: single-package-license-swap-rehearsal`）：
+
+- `package` —— 被替换包的 id/名称/版本，`before`/`after` 双方许可证
+  （token、展示名、类别），以及候选与原许可证规范化后是否相同的 `unchanged_license`；
+- `status_before` / `status_after` —— 审计整体状态（`conflict` / `warning` / `clean`）；
+- `summary.before` / `summary.after` / `summary.net` —— 原结果与预演结果的
+  硬冲突数、需人工确认告警数、冲突/告警总数，以及三者的**净变化**；
+- `added` / `removed` / `changed` —— 按「祖先包 → 被依赖包」配对的差异条目：
+  - `added` 仅预演结果存在（**新增**冲突/告警），`removed` 仅原结果存在（**消失**）；
+  - `changed` 双方都在但发生变化，`fields_changed` 标明变化项：`severity`
+    （硬冲突⇄告警）、`status`（兼容判定）、`ancestor_license` / `node_license`
+    （许可证变化）、`path`（最短路径变化）、`reason`（判定理由）；
+  - 每条携带 `before` / `after` 两个完整冲突对象，均含各自的 `path` 最短依赖路径
+    （缺失侧为 `null`），并以 `severity_before` / `severity_after`、
+    `distance_before` / `distance_after` 便于直接渲染徽标；
+  - `role` 标注该配对相对被替换包的角色：`as_ancestor`（被替换包是祖先）、
+    `as_dependency`（被替换包是被依赖方）、`unrelated`（其他祖先/被依赖方，
+    仅因最短路径变化而间接受影响）；
+- `summary.severity_flips` —— 等级翻转计数：`error_to_warning` / `warning_to_error`；
+- `summary.added_errors` / `removed_errors` / `changed_errors` 与 `summary.roles`
+  —— 各差异桶的硬冲突数与按角色统计；
+- `nodes_after` —— 预演后的节点简表（供网页在「预演结果」侧路径上标注新许可证）。
+
+预演是**只读**操作：不会创建审计记录，也不会改动任何复核标记；预演结果中的
+冲突不附着复核标记，数据库里的审计 JSON、原冲突与两次审计对比均不受影响。
+原生 manifest 与 CycloneDX 审计（`audit.source_format` 原样带出）都可直接预演。
+
+错误情形均返回明确信息：
+
+```bash
+$ curl -i "http://localhost:8000/api/audits/999/license-swap?package=app@1&license=MIT"
+HTTP/1.1 404 Not Found
+{"detail":"审计记录不存在：999。许可证替换预演为只读操作，不会创建新审计。"}
+
+$ curl -i "http://localhost:8000/api/audits/1/license-swap?package=ghost@1&license=MIT"
+HTTP/1.1 422 Unprocessable Entity
+{"detail":"审计中不存在包：ghost@1。许可证替换预演只能选择该审计中已存在的包节点。"}
+
+$ curl -i "http://localhost:8000/api/audits/1/license-swap?package=app@1&license=OFL-1.1"
+HTTP/1.1 422 Unprocessable Entity
+{"detail":"候选许可证 'OFL-1.1' 不在内置许可证兼容矩阵中（规范化结果：OFL-1.1）。预演仅支持矩阵内置的 SPDX 许可证：MIT、ISC、…、Proprietary。"}
+```
+
+只给包名且审计中存在多个同名不同版本的包时返回 `422` 并列出候选，提示改用
+`name@version` 消歧；候选许可证经别名规范化后**未识别**（含 `UNLICENSED`）
+一律 `422`，不会退化为 unknown 告警。网页端在第 4 节依次选择审计、包（下拉中
+显示当前许可证）与按类别分组的候选 SPDX 许可证后点击「预演替换许可证」即可，
+结果按新增 / 消失 / 变化分组展示，每条同时渲染原结果（红）与预演结果（绿）的
+最短依赖路径，可反复调整重新预演。
+
 ## 审计结果结构（节选）
 
 ```json
@@ -406,18 +477,19 @@ CycloneDX 导入的审计结果结构相同，另带 `"source_format": "cycloned
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由（JSON API + 网页，含两次审计对比与复核标记接口）
+│   ├── main.py        # FastAPI 路由（JSON API + 网页，含两次审计对比、复核标记、退役/许可证替换预演接口）
 │   ├── analyzer.py    # manifest 解析、节点规范化、传递约束、最短路径（自动路由 CycloneDX）
 │   ├── cyclonedx.py   # CycloneDX JSON 导入：bom-ref 映射节点、ref/dependsOn 还原依赖边
 │   ├── compare.py     # 两次审计对比：节点/冲突配对与变化检测（纯只读）
 │   ├── retire.py      # 根包退役预演：从剩余根包重算可达集合（纯只读）
+│   ├── license_swap.py# 单包许可证替换预演：仅换一个节点许可证并沿原图重算、配对差异（纯只读）
 │   ├── reviews.py     # 复核标记：指纹计算、失效时间规范化、审计结果附着
 │   ├── licenses.py    # 许可证别名规范化与兼容矩阵
 │   └── database.py    # SQLite 初始化与审计记录/复核标记持久化
 ├── static/
 │   ├── index.html     # 单文件网页（无外部 CDN 依赖）
 │   └── examples/      # sample-manifest.json 与 sample-cyclonedx.json 两个内置示例
-├── tests/             # 轻量自测：python -m tests.test_analyzer / test_compare / test_reviews / test_cyclonedx / test_retire
+├── tests/             # 轻量自测：python -m tests.test_analyzer / test_compare / test_reviews / test_cyclonedx / test_retire / test_license_swap
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
